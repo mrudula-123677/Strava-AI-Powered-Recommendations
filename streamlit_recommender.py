@@ -52,6 +52,66 @@ def load_model_artifacts():
 def load_synthetic_data():
     return pd.read_csv(SYNTHETIC_DATA_PATH)
 
+@st.cache_data
+def get_demo_users():
+    df = load_synthetic_data()
+    if "distance_km_user" in df.columns:
+        df["distance_m"] = df["distance_km_user"] * 1000
+    elif "distance_m" not in df.columns:
+        df["distance_m"] = 5000
+    
+    if "average_pace_min_per_km" in df.columns and "distance_km_user" in df.columns:
+        df["duration_s"] = df["average_pace_min_per_km"] * df["distance_km_user"] * 60
+    elif "duration_s" not in df.columns:
+        df["duration_s"] = 1800
+    
+    user_stats = df.groupby('user_id', as_index=False).agg({
+        'route_id': 'count',
+        'distance_m': 'sum',
+        'duration_s': 'sum'
+    })
+    user_stats.columns = ['user_id', 'activity_count', 'total_distance', 'total_duration']
+    return user_stats.sort_values('activity_count', ascending=False)
+
+def get_user_activities(user_id):
+    df = load_synthetic_data()
+    user_df = df[df['user_id'] == user_id].copy()
+    
+    if "distance_km_user" in user_df.columns:
+        user_df["distance_m"] = user_df["distance_km_user"] * 1000
+    if "elevation_meters_user" in user_df.columns:
+        user_df["elevation_gain_m"] = user_df["elevation_meters_user"]
+    if "average_pace_min_per_km" in user_df.columns and "distance_km_user" in user_df.columns:
+        user_df["duration_s"] = user_df["average_pace_min_per_km"] * user_df["distance_km_user"] * 60
+    
+    if "route_id" in user_df.columns:
+        user_df["id"] = user_df["user_id"].astype(str) + "_" + user_df["route_id"].astype(str)
+    
+    for col in ['distance_m', 'duration_s', 'elevation_gain_m']:
+        if col not in user_df.columns:
+            user_df[col] = 0.0
+    
+    user_df = user_df.fillna(0.0)
+    
+    sport_mapping = {
+        'Road': 'running',
+        'Trail': 'hiking',
+        'Track': 'running',
+        'Mixed': 'cycling'
+    }
+    
+    if 'surface_type_route' in user_df.columns:
+        user_df['sport'] = user_df['surface_type_route'].map(sport_mapping).fillna('running')
+    else:
+        user_df['sport'] = 'running'
+    
+    return user_df
+
+def get_user_seen_routes(user_id, artifacts):
+    user_seen_df = artifacts["user_seen"]
+    user_routes = user_seen_df[user_seen_df['user_id'] == user_id]['route_id'].tolist()
+    return set(str(r) for r in user_routes)
+
 def compute_similarity(query_idx, embeddings, k=10):
     query_vector = embeddings[query_idx:query_idx+1]
     similarities = cosine_similarity(query_vector, embeddings)[0]
@@ -94,7 +154,23 @@ def mmr_rerank(query_idx, embeddings, candidate_indices, candidate_scores, lambd
     
     return selected
 
-def get_recommendations(route_id, artifacts, strategy="content", lambda_param=0.3, k=10):
+def compute_collaborative_scores(route_id, artifacts):
+    user_seen_df = artifacts["user_seen"]
+    
+    users_with_route = user_seen_df[user_seen_df['route_id'] == route_id]['user_id'].unique()
+    
+    if len(users_with_route) == 0:
+        return {}
+    
+    other_routes = user_seen_df[user_seen_df['user_id'].isin(users_with_route)]
+    route_counts = other_routes[other_routes['route_id'] != route_id]['route_id'].value_counts()
+    
+    total = len(users_with_route)
+    collab_scores = {str(rid): count / total for rid, count in route_counts.items()}
+    
+    return collab_scores
+
+def get_recommendations(route_id, artifacts, strategy="content", lambda_param=0.3, k=10, user_id=None, exclude_seen=False):
     route_id_to_idx = artifacts["route_id_to_idx"]
     idx_to_route_id = artifacts["idx_to_route_id"]
     embeddings = artifacts["embeddings"]
@@ -105,24 +181,80 @@ def get_recommendations(route_id, artifacts, strategy="content", lambda_param=0.
     query_idx = route_id_to_idx[route_id]
     
     if strategy == "content":
-        similar_indices, similar_scores = compute_similarity(query_idx, embeddings, k=k)
+        similar_indices, similar_scores = compute_similarity(query_idx, embeddings, k=k*2)
         results = [(idx_to_route_id[idx], score) for idx, score in zip(similar_indices, similar_scores)]
         
     elif strategy == "content_mmr":
         candidate_k = k * 10
         similar_indices, similar_scores = compute_similarity(query_idx, embeddings, k=candidate_k)
-        reranked = mmr_rerank(query_idx, embeddings, similar_indices, similar_scores, lambda_param, k)
+        reranked = mmr_rerank(query_idx, embeddings, similar_indices, similar_scores, lambda_param, k*2)
         results = [(idx_to_route_id[idx], score) for idx, score in reranked]
+        
+    elif strategy == "ensemble":
+        candidate_k = k * 10
+        similar_indices, similar_scores = compute_similarity(query_idx, embeddings, k=candidate_k)
+        
+        collab_scores = compute_collaborative_scores(route_id, artifacts)
+        
+        if not collab_scores:
+            results = [(idx_to_route_id[idx], score) for idx, score in zip(similar_indices[:k*2], similar_scores[:k*2])]
+        else:
+            content_normalized = (similar_scores - similar_scores.min()) / (similar_scores.max() - similar_scores.min() + 1e-10)
+            
+            ensemble_results = []
+            for idx, content_score, norm_score in zip(similar_indices, similar_scores, content_normalized):
+                rid = idx_to_route_id[idx]
+                collab_score = collab_scores.get(rid, 0)
+                
+                collab_max = max(collab_scores.values()) if collab_scores else 1.0
+                collab_normalized = collab_score / (collab_max + 1e-10)
+                
+                ensemble_score = 0.6 * norm_score + 0.4 * collab_normalized
+                ensemble_results.append((rid, ensemble_score))
+            
+            ensemble_results.sort(key=lambda x: x[1], reverse=True)
+            results = ensemble_results[:k*2]
+    
+    elif strategy == "ensemble_mmr":
+        candidate_k = k * 10
+        similar_indices, similar_scores = compute_similarity(query_idx, embeddings, k=candidate_k)
+        
+        collab_scores = compute_collaborative_scores(route_id, artifacts)
+        
+        if not collab_scores:
+            reranked = mmr_rerank(query_idx, embeddings, similar_indices, similar_scores, lambda_param, k*2)
+            results = [(idx_to_route_id[idx], score) for idx, score in reranked]
+        else:
+            content_normalized = (similar_scores - similar_scores.min()) / (similar_scores.max() - similar_scores.min() + 1e-10)
+            
+            ensemble_scores = []
+            for idx, norm_score in zip(similar_indices, content_normalized):
+                rid = idx_to_route_id[idx]
+                collab_score = collab_scores.get(rid, 0)
+                
+                collab_max = max(collab_scores.values())
+                collab_normalized = collab_score / (collab_max + 1e-10)
+                
+                ensemble_score = 0.6 * norm_score + 0.4 * collab_normalized
+                ensemble_scores.append(ensemble_score)
+            
+            ensemble_scores = np.array(ensemble_scores)
+            reranked = mmr_rerank(query_idx, embeddings, similar_indices, ensemble_scores, lambda_param, k*2)
+            results = [(idx_to_route_id[idx], score) for idx, score in reranked]
         
     elif strategy == "popularity":
         popularity_df = artifacts["popularity"].sort_values("popularity_score", ascending=False)
-        top_routes = popularity_df.head(k)
+        top_routes = popularity_df.head(k*2)
         results = list(zip(top_routes["route_id"], top_routes["popularity_score"]))
     
     else:
         return None, f"Unknown strategy: {strategy}"
     
-    return results, None
+    if exclude_seen and user_id:
+        seen_routes = get_user_seen_routes(user_id, artifacts)
+        results = [(rid, score) for rid, score in results if rid not in seen_routes]
+    
+    return results[:k], None
 
 def get_route_details(route_id, artifacts):
     route_meta = artifacts["route_meta"]
@@ -160,8 +292,9 @@ def main():
         st.metric("NDCG@10", f"{metrics['ndcg_at_10']:.4f}")
         st.metric("Recall@5", f"{metrics['recall_at_5']:.3f}")
     
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "Recommendations",
+        "Live Demo",
         "Strategy Comparison",
         "Data Exploration",
         "Model Details"
@@ -188,7 +321,7 @@ def main():
         with col1:
             strategy = st.selectbox(
                 "Recommendation Strategy",
-                ["content", "content_mmr", "popularity"],
+                ["content", "content_mmr", "ensemble", "ensemble_mmr", "popularity"],
                 index=1
             )
         
@@ -265,6 +398,185 @@ def main():
             st.plotly_chart(fig, use_container_width=True)
     
     with tab2:
+        st.header("Live Demo Mode")
+        st.markdown("Load synthetic user data and test recommendations interactively")
+        
+        col1, col2 = st.columns([1, 2])
+        
+        with col1:
+            st.subheader("User Selection")
+            
+            demo_users = get_demo_users()
+            
+            user_options = [
+                f"{row['user_id']} ({row['activity_count']} activities, {row['total_distance']/1000:.1f}km)"
+                for _, row in demo_users.head(20).iterrows()
+            ]
+            
+            selected_user_display = st.selectbox(
+                "Select Demo User",
+                user_options,
+                index=0
+            )
+            
+            selected_user_id = selected_user_display.split(" (")[0]
+            
+            col_a, col_b, col_c = st.columns(3)
+            user_data = demo_users[demo_users['user_id'] == selected_user_id].iloc[0]
+            with col_a:
+                st.metric("Activities", user_data['activity_count'])
+            with col_b:
+                st.metric("Distance", f"{user_data['total_distance']/1000:.1f}km")
+            with col_c:
+                st.metric("Time", f"{user_data['total_duration']/3600:.1f}h")
+            
+            st.markdown("---")
+            
+            st.subheader("Strategy Settings")
+            
+            demo_strategy = st.selectbox(
+                "Recommendation Strategy",
+                ["content", "content_mmr", "ensemble", "ensemble_mmr", "popularity"],
+                index=1,
+                key="demo_strategy"
+            )
+            
+            strategy_descriptions = {
+                "content": "Fast cosine similarity matching",
+                "content_mmr": "Best quality: Balances relevance with diversity using MMR",
+                "ensemble": "Combines content-based + collaborative filtering",
+                "ensemble_mmr": "Best coverage: Ensemble with diversity reranking",
+                "popularity": "Shows most popular routes from historical data"
+            }
+            
+            st.info(strategy_descriptions[demo_strategy])
+            
+            if "mmr" in demo_strategy:
+                demo_lambda = st.slider(
+                    "Diversity Level",
+                    0.0, 1.0, 0.3, 0.1,
+                    key="demo_lambda",
+                    help="Higher values = more diversity"
+                )
+                
+                if demo_lambda <= 0.3:
+                    st.caption("Similar to usual routes")
+                elif demo_lambda < 0.7:
+                    st.caption("Mix of familiar and new routes")
+                else:
+                    st.caption("Discover different route types")
+            else:
+                demo_lambda = 0.3
+            
+            demo_exclude_seen = st.checkbox(
+                "Exclude routes already completed",
+                value=False,
+                key="demo_exclude_seen"
+            )
+            
+            demo_k = st.slider("Number of recommendations", 5, 20, 10, key="demo_k")
+        
+        with col2:
+            st.subheader("User Activities")
+            
+            user_activities = get_user_activities(selected_user_id)
+            
+            if len(user_activities) > 0:
+                st.info(f"Showing {len(user_activities)} activities for {selected_user_id}")
+                
+                activity_display = []
+                for _, activity in user_activities.head(50).iterrows():
+                    route_id = activity.get('route_id', 'Unknown')
+                    activity_display.append({
+                        "Route": route_id,
+                        "Sport": activity.get('sport', 'running').title(),
+                        "Distance": f"{activity['distance_m']/1000:.2f} km",
+                        "Duration": f"{activity['duration_s']/60:.0f} min",
+                        "Elevation": f"{activity.get('elevation_gain_m', 0):.0f} m"
+                    })
+                
+                activity_df = pd.DataFrame(activity_display)
+                
+                selected_activity_idx = st.selectbox(
+                    "Select an activity to get recommendations",
+                    range(len(activity_display)),
+                    format_func=lambda i: f"{activity_display[i]['Route']} - {activity_display[i]['Sport']} - {activity_display[i]['Distance']}"
+                )
+                
+                selected_activity_data = user_activities.iloc[selected_activity_idx]
+                selected_route_id = str(selected_activity_data.get('route_id', ''))
+                
+                st.markdown("---")
+                
+                col_x, col_y, col_z = st.columns(3)
+                with col_x:
+                    st.metric("Distance", f"{selected_activity_data['distance_m']/1000:.2f} km")
+                with col_y:
+                    st.metric("Elevation", f"{selected_activity_data.get('elevation_gain_m', 0):.0f} m")
+                with col_z:
+                    st.metric("Duration", f"{selected_activity_data['duration_s']/60:.0f} min")
+                
+                if st.button("Generate Recommendations", type="primary", key="demo_generate"):
+                    with st.spinner("Computing recommendations..."):
+                        demo_results, demo_error = get_recommendations(
+                            selected_route_id,
+                            artifacts,
+                            strategy=demo_strategy,
+                            lambda_param=demo_lambda,
+                            k=demo_k,
+                            user_id=selected_user_id,
+                            exclude_seen=demo_exclude_seen
+                        )
+                        
+                        if demo_error:
+                            st.error(demo_error)
+                        else:
+                            st.session_state.demo_recommendations = demo_results
+                            st.session_state.demo_query_route = selected_route_id
+                            st.session_state.demo_user_id = selected_user_id
+                
+                if "demo_recommendations" in st.session_state:
+                    st.markdown("---")
+                    st.subheader(f"Recommendations for Route: {st.session_state.demo_query_route}")
+                    
+                    if demo_exclude_seen:
+                        seen_count = len(get_user_seen_routes(st.session_state.demo_user_id, artifacts))
+                        st.caption(f"Filtered out {seen_count} routes already completed by this user")
+                    
+                    demo_rec_data = []
+                    for rank, (route_id, score) in enumerate(st.session_state.demo_recommendations, 1):
+                        details = get_route_details(route_id, artifacts)
+                        if details:
+                            demo_rec_data.append({
+                                "Rank": rank,
+                                "Route": route_id,
+                                "Score": f"{score:.4f}",
+                                "Distance": f"{details['distance_km_route']:.2f} km",
+                                "Elevation": f"{details['elevation_meters_route']:.0f} m",
+                                "Difficulty": f"{details['difficulty_score']:.2f}",
+                                "Surface": details['surface_type_route']
+                            })
+                    
+                    demo_rec_df = pd.DataFrame(demo_rec_data)
+                    st.dataframe(demo_rec_df, use_container_width=True, hide_index=True)
+                    
+                    fig = px.bar(
+                        demo_rec_df,
+                        x="Route",
+                        y=[float(x) for x in demo_rec_df["Score"]],
+                        title=f"Recommendation Scores ({demo_strategy})",
+                        labels={"y": "Similarity Score", "x": "Route ID"},
+                        color=[float(x) for x in demo_rec_df["Score"]],
+                        color_continuous_scale="viridis"
+                    )
+                    fig.update_layout(showlegend=False)
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    st.caption(f"Strategy: {demo_strategy} | Lambda: {demo_lambda if 'mmr' in demo_strategy else 'N/A'}")
+            else:
+                st.warning("No activities found for this user")
+    
+    with tab3:
         st.header("Strategy Comparison")
         
         strategies_info = {
@@ -279,6 +591,18 @@ def main():
                 "description": "Content-based with MMR reranking for diverse results",
                 "speed": "Fast",
                 "quality": "Best MAP & NDCG"
+            },
+            "ensemble": {
+                "name": "Ensemble (Content + Collaborative)",
+                "description": "Combines content-based and collaborative filtering (60/40 blend)",
+                "speed": "Moderate",
+                "quality": "Improved coverage"
+            },
+            "ensemble_mmr": {
+                "name": "Ensemble + Diversity",
+                "description": "Ensemble approach with MMR reranking for maximum coverage",
+                "speed": "Moderate",
+                "quality": "Best Recall"
             },
             "popularity": {
                 "name": "Popularity-Based",
@@ -325,7 +649,7 @@ def main():
         )
         st.plotly_chart(fig, use_container_width=True)
     
-    with tab3:
+    with tab4:
         st.header("Data Exploration")
         
         st.subheader("Route Statistics")
@@ -404,7 +728,7 @@ def main():
         )
         st.plotly_chart(fig, use_container_width=True)
     
-    with tab4:
+    with tab5:
         st.header("Model Details")
         
         st.subheader("Model Card")
