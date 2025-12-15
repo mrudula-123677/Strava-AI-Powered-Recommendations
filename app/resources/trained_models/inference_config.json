@@ -1,0 +1,8 @@
+{
+  "default_k": 10,
+  "default_strategy": "content_mmr",
+  "default_lambda": 0.3,
+  "filter_seen": true,
+  "min_similarity_threshold": 0.0,
+  "max_candidates": 100
+}

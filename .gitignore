@@ -10,5 +10,4 @@ tokens.json
 .kiro/
 
 # Trained models (large files)
-app/resources/trained_models/
 .mailmap

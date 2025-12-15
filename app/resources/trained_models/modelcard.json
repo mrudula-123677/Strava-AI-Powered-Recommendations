@@ -1,0 +1,71 @@
+{
+  "model_name": "Strava Route Recommender",
+  "version": "1.0.0",
+  "trained_at": "2025-10-28T03:40:16.136550",
+  "training_data": {
+    "num_activities": 1987,
+    "num_users": 50,
+    "num_routes": 100,
+    "source": "synthetic_strava_data.csv"
+  },
+  "model_components": {
+    "content_based": true,
+    "matrix_factorization": false,
+    "ann_retrieval": false,
+    "mmr_reranking": true
+  },
+  "feature_schema": {
+    "columns": [
+      "distance_km_route",
+      "elevation_meters_route",
+      "difficulty_score",
+      "grade_percent",
+      "traffic_stress",
+      "grade_flat",
+      "grade_rolling",
+      "grade_hilly",
+      "grade_steep",
+      "is_likely_loop",
+      "is_likely_out_back",
+      "is_morning",
+      "is_afternoon",
+      "is_evening",
+      "is_night",
+      "is_weekend",
+      "is_weekday",
+      "surface_Mixed",
+      "surface_Road",
+      "surface_Track",
+      "surface_Trail",
+      "geo_0",
+      "geo_1",
+      "geo_2",
+      "geo_3",
+      "geo_4",
+      "geo_5",
+      "geo_6",
+      "geo_9"
+    ],
+    "scaler_type": "StandardScaler"
+  },
+  "evaluation_metrics": {
+    "recall_at_5": 0.06,
+    "map_at_5": 0.03666666666666667,
+    "ndcg_at_5": 0.042618595071429156,
+    "recall_at_10": 0.1,
+    "map_at_10": 0.042222222222222223,
+    "ndcg_at_10": 0.05576333872686922
+  },
+  "best_strategy": "content_mmr",
+  "strategy_descriptions": {
+    "content": "Pure content-based similarity",
+    "content_mmr": "Content-based with MMR diversity (RECOMMENDED)",
+    "ensemble": "Content + Matrix Factorization",
+    "ensemble_mmr": "Ensemble with MMR diversity (best recall)"
+  },
+  "library_versions": {
+    "pandas": "2.3.3",
+    "numpy": "2.3.4",
+    "scikit_learn": "latest"
+  }
+}
