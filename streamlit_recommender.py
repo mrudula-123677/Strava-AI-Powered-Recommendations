@@ -15,32 +15,33 @@ st.set_page_config(
     layout="wide"
 )
 
-TRAINED_MODEL_DIR = Path("app/resources/trained_models")
-SYNTHETIC_DATA_PATH = Path("app/resources/synthetic_strava_data.csv")
+REPO_ROOT = Path(__file__).resolve().parent
+TRAINED_MODEL_DIR = REPO_ROOT / "app" / "resources" / "trained_models"
+SYNTHETIC_DATA_PATH = REPO_ROOT / "app" / "resources" / "synthetic_strava_data.csv"
 
 @st.cache_resource
 def load_model_artifacts():
     artifacts = {}
     
-    with open(TRAINED_MODEL_DIR / "modelcard.json", "r") as f:
+    with open(TRAINED_MODEL_DIR / "modelcard.json", "r", encoding="utf-8") as f:
         artifacts["modelcard"] = json.load(f)
     
-    with open(TRAINED_MODEL_DIR / "inference_config.json", "r") as f:
+    with open(TRAINED_MODEL_DIR / "inference_config.json", "r", encoding="utf-8") as f:
         artifacts["inference_config"] = json.load(f)
     
-    artifacts["embeddings"] = np.load(TRAINED_MODEL_DIR / "retrieval/route_embeddings.npy")
+    artifacts["embeddings"] = np.load(str(TRAINED_MODEL_DIR / "retrieval" / "route_embeddings.npy"))
     
-    with open(TRAINED_MODEL_DIR / "retrieval/route_id_to_idx.json", "r") as f:
+    with open(TRAINED_MODEL_DIR / "retrieval" / "route_id_to_idx.json", "r", encoding="utf-8") as f:
         artifacts["route_id_to_idx"] = json.load(f)
     
-    with open(TRAINED_MODEL_DIR / "retrieval/feature_columns.json", "r") as f:
+    with open(TRAINED_MODEL_DIR / "retrieval" / "feature_columns.json", "r", encoding="utf-8") as f:
         artifacts["feature_columns"] = json.load(f)
     
-    artifacts["popularity"] = pd.read_csv(TRAINED_MODEL_DIR / "heuristics/popularity.csv")
-    artifacts["route_meta"] = pd.read_csv(TRAINED_MODEL_DIR / "meta/route_meta.csv")
-    artifacts["user_seen"] = pd.read_csv(TRAINED_MODEL_DIR / "meta/user_seen.csv")
+    artifacts["popularity"] = pd.read_csv(str(TRAINED_MODEL_DIR / "heuristics" / "popularity.csv"))
+    artifacts["route_meta"] = pd.read_csv(str(TRAINED_MODEL_DIR / "meta" / "route_meta.csv"))
+    artifacts["user_seen"] = pd.read_csv(str(TRAINED_MODEL_DIR / "meta" / "user_seen.csv"))
     
-    with open(TRAINED_MODEL_DIR / "heuristics/mmr_config.json", "r") as f:
+    with open(TRAINED_MODEL_DIR / "heuristics" / "mmr_config.json", "r", encoding="utf-8") as f:
         artifacts["mmr_config"] = json.load(f)
     
     idx_to_route_id = {idx: route_id for route_id, idx in artifacts["route_id_to_idx"].items()}
@@ -50,7 +51,7 @@ def load_model_artifacts():
 
 @st.cache_data
 def load_synthetic_data():
-    return pd.read_csv(SYNTHETIC_DATA_PATH)
+    return pd.read_csv(str(SYNTHETIC_DATA_PATH))
 
 @st.cache_data
 def get_demo_users():
